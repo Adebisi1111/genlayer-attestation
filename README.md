@@ -1,0 +1,301 @@
+# Attestation — Verifiable Intelligence for Trusted Yardsticks
+
+A standalone GenLayer Intelligent Contract primitive that evaluates work
+deliverables across 4 dimensions using a **single AI consensus round**.
+
+```
+Contract address (Studio Net): NOT YET DEPLOYED
+Deploy tx:                  NOT YET DEPLOYED
+```
+
+This contract has not been deployed. An earlier, withdrawn submission is a
+different contract at a different address and is not related to this one.
+
+## What it does
+
+An issuer posts a verification job: an artifact URL, a test command, and the
+requirements the work must satisfy.  When the job is ready, a leader LLM
+evaluates the deliverable across 4 dimensions inside ONE non-deterministic
+block.  Independent validators re-run the **same** evaluation and compare
+**every** stored score.  Only when all 4 dimension scores AND the categorical
+verdict agree does the contract update reputation on-chain.
+
+## Why GenLayer (and not a solo LLM)
+
+A single LLM "does this code work?" answer is unverifiable by third parties
+and unrepeatable.  Attestation instead:
+
+- **ONE consensus round covers 4 orthogonal dimensions** (functional, quality,
+  security, completeness) so builders get a structured scorecard, not just
+  pass/fail.
+- **Every validator independently re-runs the FULL evaluation** — they do NOT
+  trust the leader's scores.  Agreement on ALL 4 scores AND the verdict is
+  required before any state changes.
+- **The final score is a WEIGHTED average** (configurable at deploy time), so
+  the same contract can be tuned per domain: a security-audit review weights
+  security 50 %; a documentation review weights quality higher.
+- **Reputation is tracked on-chain** and updated ONLY after
+  consensus, so the ledger is auditable and economically binding.
+
+## State design
+
+| Storage | Type | Purpose |
+|---|---|---|
+| `agents` | `TreeMap[str, AgentRecord]` | Reputation, completed/failed counts, demotions, cumulative score |
+| `jobs` | `TreeMap[str, Job]` | Every verification request |
+| `verifications` | `TreeMap[str, Scorecard]` | Published consensus scorecards |
+| `reviewed` | `TreeMap[str, str]` | `(repo_url:commit_hash) → "1"` — prevents re-reviewing identical work |
+
+## Consensus design
+
+Single `gl.vm.run_nondet_unsafe` call, two-phase:
+
+1. **leader_fn**: fetch artifact → simulate test run → read requirements →
+   score 4 dimensions → compute weighted overall → categorical verdict
+   (PASS / PARTIAL / FAIL)
+2. **validator_fn**: re-run leader_fn independently.  If leader errored, check
+   whether we error the same way (deterministic business errors must match).
+   Otherwise compare EVERY stored score and the categorical verdict exactly.
+   Any mismatch → disagree → leader rotates.
+
+**Error classification:**
+- Deterministic business errors (bad URL, missing requirements) must match
+  exactly between leader and validator.
+- Transient LLM/web failures: leader errors, validator succeeds → disagree →
+  leader rotates, retry.
+- LLM malformed output: validator disagrees → rotate rather than locking in
+  broken output.
+
+## Deploy-time tunable parameters
+
+All set via constructor arguments — no code change needed:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `weight_functional` | 40 | Weight of "does it work?" |
+| `weight_quality` | 25 | Weight of "is it well-built?" |
+| `weight_security` | 25 | Weight of "is it safe?" |
+| `weight_completeness` | 10 | Weight of "is everything there?" |
+| `pass_threshold` | 70 | Overall ≥ this → PASS |
+| `partial_threshold` | 40 | Overall ≥ this → PARTIAL |
+| `slash_percent` | 10 | Reputation lost per unit of FAIL |
+| `min_reputation` | 300 | Reputation floor for eligibility |
+| `max_demotions` | 3 | Demotions that end eligibility |
+
+All four weights **must** sum to exactly 100.  Thresholds and slash percent
+can be set to 0 to disable those features if a deployment only wants scoring
+without economics.
+
+## Why there is no custody
+
+**This contract holds no native funds and owes none.**
+
+That is a design decision forced by the platform, and it is worth stating
+plainly rather than working around.
+
+A GenLayer Intelligent Contract cannot move native funds. The stdlib exposes
+`emit_transfer`, but only on *external contract proxies* — the `Contract` base
+class that an IC inherits from has no such method. Verified by probing the
+runtime rather than inferred from documentation:
+
+```
+self.emit_transfer=False  self.transfer=False  self.send=False
+self.withdraw=False       self.burn=False       self.emit=False
+gl.transfer=False         gl.send=False         gl.emit_transfer=False
+vm.transfer=False         vm.send=False         vm.emit_transfer=False
+```
+
+A previous version of this contract kept a stake ledger anyway: agents deposited
+GEN, and `claim_withdraw` / `dispose_slashed` moved numbers around inside the
+contract without ever transferring anything. It recorded debts it could never
+pay, and the deployed contract's native balance was zero while the ledger
+claimed otherwise.
+
+So the ledger is gone rather than kept as accounting:
+
+| Removed | Replaced by |
+|---|---|
+| `register()` was payable | not payable; reputation starts at the floor |
+| `staked`, `min_stake` | `reputation`, `min_reputation` |
+| `request_withdraw` / `claim_withdraw` | nothing to withdraw |
+| `dispose_slashed`, `slashed_sink` | `demotions`, `demoted_total` |
+| stake burn on FAIL | proportional reputation reduction |
+
+**Enforcement is reputational.** `get_standing` reports `eligible`, `_tier`
+reports `UNVERIFIED`, and both are readable before an issuer posts work. Losing
+standing means fewer issuers choose you — a real cost the chain can enforce,
+without custody it cannot honour.
+
+Every view that touches agent state returns `holds_funds: false` explicitly, so
+a reader never has to infer it.
+
+## API
+
+### Write methods
+
+**`register()`** — `@gl.public.write` (NOT payable)
+Register as a verifiable agent. Idempotent. There is no deposit and no balance:
+the contract holds no funds and owes none. Reputation starts at the floor and
+moves only through verified work, so standing cannot be bought.
+
+**`post_job(job_id, agent, repo_url, commit_hash, test_command, requirements, deadline)`** —
+`@gl.public.write`
+Issuer posts a verification job for an agent's deliverable.
+
+**`accept_job(job_id)`** — `@gl.public.write`
+The **named agent** accepts the job, binding itself to the artifact,
+requirements, deadline and slashing exposure together. Only the named agent may
+call. Until this is called the job cannot touch reputation in any direction.
+Returns a digest of every accepted term; the issuer cannot alter the job
+afterwards without voiding the acceptance.
+
+**`decline_job(job_id)`** — `@gl.public.write`
+The named agent (or the issuer) refuses. No reputation effect.
+
+**`verify(job_id)`** — `@gl.public.write`
+Run consensus verification and update reputation. **Refuses any job the agent
+has not accepted**, and refuses if the terms no longer match what was accepted. Before the deadline only the agent or issuer may call; after it,
+anyone may.
+
+**`settle_unclaimed(job_id)`** — `@gl.public.write`
+Settle an expired, unverified job. An **accepted** job that was then abandoned
+is demoted — acceptance is a real obligation. A job that was **never accepted**
+simply expires as `EXPIRED_UNACCEPTED`: no reputation change, and the artifact
+key stays free.
+
+**`deactivate()`** — `@gl.public.write`
+Voluntary, irreversible exit from the verified set. There is no `activate()`,
+and `register()` refuses a deactivated agent, so a departure cannot be undone
+by starting reputation over. Refused while an accepted job is outstanding.
+
+**There is deliberately no `withdraw`, `claim`, or `dispose` method.** Those
+existed so the contract could settle native funds, which a GenLayer
+Intelligent Contract cannot do: `emit_transfer` is exposed only on external
+contract proxies, and the `Contract` base class does not provide it. Keeping
+them would have meant recording debts that could never be paid. See
+[Why there is no custody](#why-there-is-no-custody).
+
+### View methods
+
+**`get_standing(agent)`** → JSON
+Standing record: reputation, the floor, eligibility, demotion count and total
+demoted, plus `holds_funds: false` stated explicitly so no reader has to infer
+it.
+
+**`get_config()`** → JSON
+Deployment configuration: all four weights, both thresholds, `slash_percent`,
+`min_reputation` and `max_demotions`, so any tier or eligibility decision can be
+reproduced without guessing a constant.
+
+**`get_artifact_key(repo_url, commit_hash)`** → JSON
+Whether an artifact has actually been consumed by a verification. Keys are
+reserved at verification time, not at post time.
+
+**`get_agent(agent)`** → JSON
+Get an agent's reputation record and tier (UNVERIFIED / NEW / ESTABLISHED / TRUSTED).
+
+**`get_job(job_id)`** → JSON
+Get a job's full details including verdict and scorecard reference.
+
+**`get_scorecard(job_id)`** → JSON
+Get the published consensus scorecard for a verified job.
+
+**`now()`** → string
+Current transaction timestamp in Unix seconds.
+
+## Reputation tiers
+
+| Tier | Requirements |
+|---|---|
+| UNVERIFIED | No completed jobs, or reputation below the floor |
+| NEW | Fewer than 3 completed, or avg score < 50 |
+| ESTABLISHED | 3+ completed and avg score ≥ 50 |
+| TRUSTED | 10+ completed and avg score ≥ 70 |
+
+Tiers are a function of the **track record** — jobs completed and their average
+score — not of a balance. An earlier version keyed them off staked GEN, which
+made the tier a measure of wealth rather than of work.
+
+## Testing
+
+```bash
+# Direct mode tests (in-memory, no Studio needed)
+export PYTHONPATH="$HOME/.local/lib/python3.14/site-packages/genlayer_py/client:$PYTHONPATH"
+python3.14 -m pytest tests/direct/ -v
+```
+
+**35 tests pass.** They use mocked LLM responses to cover PASS, PARTIAL and FAIL
+paths, reputation demotion and recovery, eligibility, tier transitions, and job
+validation rules.
+
+| Suite | Tests | Covers |
+|---|---|---|
+| `test_verify.py` | 9 | consensus, scorecards, PASS/PARTIAL/FAIL effects |
+| `test_jobs.py` | 6 | posting, acceptance, deadlines, cancellation |
+| `test_register.py` | 7 | registration, no-custody, demotion, recovery |
+| `test_adversarial.py` | 13 | griefing, key squatting, terms, eligibility |
+
+Three properties are asserted directly against the new model:
+
+1. **Registration holds no funds** — `register()` is not payable and
+   `get_standing` reports `holds_funds: false`.
+2. **One failure does not end a career** — demotion is proportional, and only
+   `max_demotions` failures make an agent inactive.
+3. **Standing can be recovered** — successful work restores reputation above the
+   floor and reactivates the agent.
+
+These were all real defects in the first non-custodial draft, caught by the
+tests rather than by reading the code.
+
+## Linting
+
+```bash
+genvm-lint check contracts/attestation.py
+```
+
+## Deployment
+
+```bash
+# Set network
+genlayer network set studionet
+
+# Deploy (default weights)
+echo "your_password" | genlayer deploy \
+  --contract contracts/attestation.py \
+  --rpc https://studio.genlayer.com/api
+
+# Deploy with custom weights (security-heavy)
+echo "your_password" | genlayer deploy \
+  --contract contracts/attestation.py \
+  --rpc https://studio.genlayer.com/api \
+  --args 15 15 60 10 70 40 10 300 3
+```
+
+## Explorer
+
+Not deployed yet. Once deployed this section will carry the address, the deploy
+transaction, and the SHA-256 of the deployed source so the two can be compared.
+
+The `--args` above are `weight_functional weight_quality weight_security
+weight_completeness pass_threshold partial_threshold slash_percent
+min_reputation max_demotions` — the last two being the standing tunables that
+replaced `min_stake_wei` and `slash_percent`-as-burn.
+
+## File structure
+
+```
+agent-attestation/
+├── contracts/
+│   └── attestation.py          # The intelligent contract (679 lines)
+├── tests/
+│   └── direct/
+│       ├── conftest.py    # Shared test helpers
+│       ├── test_register.py   # Agent registration + standing tests
+│       ├── test_jobs.py       # Job posting validation tests
+│       └── test_verify.py     # Consensus + reputation + scorecard tests
+└── README.md
+```
+
+## License
+
+MIT
