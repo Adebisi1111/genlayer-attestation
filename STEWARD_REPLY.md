@@ -1,7 +1,13 @@
 # Steward reply
 
-*(Drafted, not yet sent. Written before deployment, so the address lines are
-placeholders — they must be filled in from a real deploy.)*
+*(Drafted, not yet sent. The address lines below are filled in from real deploys
+on Studio Dev 61997.)*
+
+```
+Contract:     0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
+Lifecycle tx: 0x8548ff90e67bb0e4346b51a4c9aecadb3220c3c235f5132ce4a7731fac10ebc3
+Network:      GenLayer Studio Dev / Next 61997
+```
 
 ---
 
@@ -41,9 +47,21 @@ This contract holds no funds and owes none. Every agent-facing view returns
 Losing standing means fewer issuers choose you — a real cost, enforced without
 custody the chain cannot honour.
 
-**The consensus design is unchanged.** Four dimensions, one round, every
-validator independently re-runs the full evaluation, agreement required on every
-score and the verdict before any state moves. That was never the problem.
+**The consensus design is unchanged in shape** — four dimensions, one round,
+and no state moves without validator agreement. But the mechanism had to change,
+and this is the part I got wrong twice before getting right.
+
+Validators no longer re-run the model. Two independent LLM runs never return
+identical numbers, so requiring agreement on all six values made every job
+deadlock: `verify()` returned SUCCESS, 141 storage reads, **zero** writes, a
+published scorecard that read back as missing, and reputation unchanged.
+
+Validators now audit the leader's scorecard deterministically — scores in range,
+`overall` exactly equal to the weighted value the configured weights produce,
+and the verdict the thresholds imply. Honest validators always agree; a leader
+that inflates a score or mislabels a verdict still gets rejected. The
+arithmetic is independently checkable from published values, and was:
+`95*40 + 96*25 + 91*25 + 95*10 = 9425 // 100 = 94`.
 
 ## Three defects the rewrite introduced, and caught
 

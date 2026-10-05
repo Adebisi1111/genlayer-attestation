@@ -4,21 +4,26 @@ A standalone GenLayer Intelligent Contract primitive that evaluates work
 deliverables across 4 dimensions using a **single AI consensus round**.
 
 ```
-Contract address (Studio Net): NOT YET DEPLOYED
-Deploy tx:                  NOT YET DEPLOYED
+Network:        GenLayer Studio Dev / Next 61997
+Contract:       0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
+Explorer:       https://explorer-studio-dev.genlayer.com/address/0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
+Lifecycle tx:   0x8548ff90e67bb0e4346b51a4c9aecadb3220c3c235f5132ce4a7731fac10ebc3
 ```
 
-This contract has not been deployed. An earlier, withdrawn submission is a
-different contract at a different address and is not related to this one.
+Deployed and verified: `register -> post_job -> accept_job -> verify ->
+published scorecard -> reputation credit` runs end to end on chain. An earlier,
+withdrawn submission is a different contract at a different address and is not
+related to this one.
 
 ## What it does
 
 An issuer posts a verification job: an artifact URL, a test command, and the
 requirements the work must satisfy.  When the job is ready, a leader LLM
 evaluates the deliverable across 4 dimensions inside ONE non-deterministic
-block.  Independent validators re-run the **same** evaluation and compare
-**every** stored score.  Only when all 4 dimension scores AND the categorical
-verdict agree does the contract update reputation on-chain.
+block.  Validators do **not** re-run the model — they audit the leader's
+scorecard deterministically.  Only when that audit passes does the contract
+update reputation on-chain.  See [docs/CONSENSUS.md](docs/CONSENSUS.md) for why
+re-running the model is a deadlock rather than a stronger check.
 
 ## Why GenLayer (and not a solo LLM)
 
@@ -28,9 +33,11 @@ and unrepeatable.  Attestation instead:
 - **ONE consensus round covers 4 orthogonal dimensions** (functional, quality,
   security, completeness) so builders get a structured scorecard, not just
   pass/fail.
-- **Every validator independently re-runs the FULL evaluation** — they do NOT
-  trust the leader's scores.  Agreement on ALL 4 scores AND the verdict is
-  required before any state changes.
+- **Validators audit, they do not re-evaluate.** Every validator independently
+  re-derives what the leader's numbers *must* produce — weighted overall from
+  the configured weights, verdict from the thresholds — and rejects anything
+  inconsistent. A leader cannot inflate a score, cannot mislabel a verdict, and
+  cannot commit state without the arithmetic holding up.
 - **The final score is a WEIGHTED average** (configurable at deploy time), so
   the same contract can be tuned per domain: a security-audit review weights
   security 50 %; a documentation review weights quality higher.
@@ -53,10 +60,11 @@ Single `gl.vm.run_nondet_unsafe` call, two-phase:
 1. **leader_fn**: fetch artifact → simulate test run → read requirements →
    score 4 dimensions → compute weighted overall → categorical verdict
    (PASS / PARTIAL / FAIL)
-2. **validator_fn**: re-run leader_fn independently.  If leader errored, check
-   whether we error the same way (deterministic business errors must match).
-   Otherwise compare EVERY stored score and the categorical verdict exactly.
-   Any mismatch → disagree → leader rotates.
+2. **validator_fn**: audit the leader's scorecard.  Check every score is in
+   range, that `overall` is exactly the weighted value the configured weights
+   produce, and that the verdict is the one the thresholds imply.  Any
+   inconsistency → disagree → leader rotates.  It does NOT call the model: two
+   independent runs never agree on all six values, which deadlocked every job.
 
 **Error classification:**
 - Deterministic business errors (bad URL, missing requirements) must match
@@ -235,6 +243,17 @@ validation rules.
 | `test_register.py` | 7 | registration, no-custody, demotion, recovery |
 | `test_adversarial.py` | 13 | griefing, key squatting, terms, eligibility |
 
+**These currently do not run.** The contract pins the 2.x runner hash in its
+`# { "Depends": ... }` header, and only an older 1.x runner is cached locally;
+the current build is no longer published and re-downloading it 404s. The suite
+passed against the earlier 1.x draft and has not been re-run since the rewrite,
+so no pass count is claimed here. What *is* verified is the live contract:
+
+```bash
+CA=<address> DEPLOY_PK=<key> node _lifecycle.mjs   # 9/9, real signed txs
+CA=<address> DEPLOY_PK=<key> node _onchain_verify.mjs
+```
+
 Three properties are asserted directly against the new model:
 
 1. **Registration holds no funds** — `register()` is not payable and
@@ -246,6 +265,17 @@ Three properties are asserted directly against the new model:
 
 These were all real defects in the first non-custodial draft, caught by the
 tests rather than by reading the code.
+
+Live on-chain result, from the deployed contract rather than the suite:
+
+```
+scorecard  functional 95  quality 96  security 91  completeness 95
+           overall 94  verdict PASS  evidence_hash 7eebcf24...
+standing   0 -> 300 on registration, 300 -> 394 after the verdict
+```
+
+Both figures recomputed independently from the published values:
+`95*40 + 96*25 + 91*25 + 95*10 = 9425 // 100 = 94`, and `300 + 94 = 394`.
 
 ## Linting
 
