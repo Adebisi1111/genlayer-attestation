@@ -1,4 +1,4 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
 """
 Attestation — Verifiable Intelligence for Trusted Yardsticks
@@ -81,10 +81,42 @@ SEE ALSO
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from genlayer import *  # noqa: F401, F403
+import genlayer as gl
+from genlayer import Address, u256
+from genlayer.storage import TreeMap
+from genlayer.storage import allow as allow_storage
+
+# Storage dataclass fields must be scalars. The 2.x runner rejects a
+# @allow_storage dataclass that holds ANY collection type - list[str],
+# list[int], DynArray[str] and tuple[str] each reproduce "invalid contract
+# runner malformed", while str, u256 and bool deploy. Proven one field at a
+# time against a contract that otherwise deploys: the first five str fields
+# pass, the sixth (requirements: list[str]) fails. So the collection-valued
+# fields below are stored as newline-joined strings and split back on read.
+# Method PARAMETERS may still take list[str]; only storage is restricted.
+
+def _join(items: list[str]) -> str:
+    return "\n".join(items)
+
+
+def _split(joined: str) -> list[str]:
+    return [x for x in joined.split("\n") if x] if joined else []
+
+
+# 2.x runner notes (Studio Next 61997):
+#   * `DynArray` must NOT be imported. Doing so makes the runner reject the whole
+#     contract with "invalid contract runner malformed" — proven by swapping only
+#     this one import into a known-good contract and reproducing the failure.
+#     Use `list[str]` in method signatures; in storage, join to a string (see
+#     _join/_split above).
+#   * `field` from dataclasses is unused here and is likewise not loadable.
+#   * a `bigint` storage field assigned a plain value is rejected too: the field
+#     must be declared `u256`, the constructor parameter must be `u256`, and the
+#     assignment must wrap it - `self.x = u256(x)`. Any one of the three missing
+#     produces the same malformed error.
 
 
 # ---------------------------------------------------------------------------
@@ -140,23 +172,11 @@ class AgentRecord:
     open_jobs: u256
 
 
-@allow_storage
-@dataclass
-class CodeArtifact:
-    """What we are verifying.
-
-    The contract retrieves the ACTUAL code files from the repository at the
-    given commit via gl.nondet.web.render, then includes their contents in the
-    evaluation prompt.  The AI model judges the real code, not just a URL.
-    """
-
-    repo_url: str
-    commit_hash: str
-    test_command: str
-    requirements: DynArray[str]
-    files: DynArray[str]
-    test_results_url: str
-
+# There is deliberately no CodeArtifact dataclass. The artifact fields are
+# flattened into Job, and a declared-but-unreferenced @allow_storage dataclass
+# is itself enough to make the 2.x runner reject the contract with "invalid
+# contract runner malformed" — proven by deleting this one declaration from an
+# otherwise-successful file.
 
 @allow_storage
 @dataclass
@@ -175,11 +195,23 @@ class Scorecard:
 @allow_storage
 @dataclass
 class Job:
-    """A single verification request."""
+    """A single verification request.
+
+    The artifact fields are flattened in rather than held as a nested
+    dataclass. A field whose type is another dataclass makes the 2.x runner
+    reject the whole contract with "invalid contract runner malformed" —
+    proven field-by-field against a known-good contract, where every scalar
+    field deploys and only the nested one fails.
+    """
 
     issuer: str
     agent: str
-    artifact: CodeArtifact
+    repo_url: str
+    commit_hash: str
+    test_command: str
+    requirements_joined: str
+    files_joined: str
+    test_results_url: str
     deadline: u256
     recorded: bool
     verdict: str
@@ -193,7 +225,7 @@ class Job:
 # Contract
 # ---------------------------------------------------------------------------
 
-class Attestation(gl.Contract):
+class Attestation(gl.contract.Contract):
     """Verifiable Intelligence for Trusted Yardsticks.
 
     Evaluates work deliverables across 4 dimensions using a single AI
@@ -211,27 +243,27 @@ class Attestation(gl.Contract):
 
     # ---- deploy-time tunables (set from constructor args) ----
 
-    weight_functional: bigint
-    weight_quality: bigint
-    weight_security: bigint
-    weight_completeness: bigint
-    pass_threshold: bigint
-    partial_threshold: bigint
-    slash_percent: bigint
+    weight_functional: u256
+    weight_quality: u256
+    weight_security: u256
+    weight_completeness: u256
+    pass_threshold: u256
+    partial_threshold: u256
+    slash_percent: u256
     min_reputation: u256
-    max_demotions: bigint
+    max_demotions: u256
 
     def __init__(
         self,
-        weight_functional: bigint = WEIGHT_FUNCTIONAL,
-        weight_quality: bigint = WEIGHT_QUALITY,
-        weight_security: bigint = WEIGHT_SECURITY,
-        weight_completeness: bigint = WEIGHT_COMPLETENESS,
-        pass_threshold: bigint = PASS_THRESHOLD,
-        partial_threshold: bigint = PARTIAL_THRESHOLD,
-        slash_percent: bigint = SLASH_PERCENT,
+        weight_functional: u256 = u256(WEIGHT_FUNCTIONAL),
+        weight_quality: u256 = u256(WEIGHT_QUALITY),
+        weight_security: u256 = u256(WEIGHT_SECURITY),
+        weight_completeness: u256 = u256(WEIGHT_COMPLETENESS),
+        pass_threshold: u256 = u256(PASS_THRESHOLD),
+        partial_threshold: u256 = u256(PARTIAL_THRESHOLD),
+        slash_percent: u256 = u256(SLASH_PERCENT),
         min_reputation_wei: u256 = MIN_REPUTATION,
-        max_demotions_: bigint = MAX_DEMOTIONS,
+        max_demotions_: u256 = u256(MAX_DEMOTIONS),
     ):
         """Deploy with (optional) tuned weights, thresholds, and economics.
 
@@ -253,15 +285,15 @@ class Attestation(gl.Contract):
         if not (0 <= pth <= pt):
             raise gl.vm.UserError("partial_threshold must be 0-pass_threshold")
 
-        self.weight_functional = weight_functional
-        self.weight_quality = weight_quality
-        self.weight_security = weight_security
-        self.weight_completeness = weight_completeness
-        self.pass_threshold = pass_threshold
-        self.partial_threshold = partial_threshold
-        self.slash_percent = slash_percent
+        self.weight_functional = u256(weight_functional)
+        self.weight_quality = u256(weight_quality)
+        self.weight_security = u256(weight_security)
+        self.weight_completeness = u256(weight_completeness)
+        self.pass_threshold = u256(pass_threshold)
+        self.partial_threshold = u256(partial_threshold)
+        self.slash_percent = u256(slash_percent)
         self.min_reputation = min_reputation_wei
-        self.max_demotions = max_demotions_
+        self.max_demotions = u256(max_demotions_)
 
     # ------------------------------------------------------------------
     # Artifact keys and acceptance terms
@@ -284,12 +316,12 @@ class Attestation(gl.Contract):
                 json.dumps(
                     {
                         "artifact": self._artifact_key(
-                            job.artifact.repo_url, job.artifact.commit_hash
+                            job.repo_url, job.commit_hash
                         ),
-                        "files": list(job.artifact.files),
-                        "test_command": job.artifact.test_command,
-                        "requirements": list(job.artifact.requirements),
-                        "test_results_url": job.artifact.test_results_url,
+                        "files": _split(job.files_joined),
+                        "test_command": job.test_command,
+                        "requirements": _split(job.requirements_joined),
+                        "test_results_url": job.test_results_url,
                         "deadline": int(job.deadline),
                         "slash_percent": int(self.slash_percent),
                         "min_reputation": int(self.min_reputation),
@@ -409,7 +441,7 @@ class Attestation(gl.Contract):
     # Single non-deterministic evaluation flow
     # ------------------------------------------------------------------
 
-    def _evaluate(self, repo_url: str, commit_hash: str, test_command: str, requirements: DynArray[str], files: DynArray[str], test_results_url: str) -> dict:
+    def _evaluate(self, repo_url: str, commit_hash: str, test_command: str, requirements: list[str], files: list[str], test_results_url: str) -> dict:
         """Score 4 dimensions in a SINGLE exec_prompt call.
 
         The contract retrieves the ACTUAL code files from the repository at the
@@ -564,7 +596,7 @@ class Attestation(gl.Contract):
         except (KeyError, TypeError):
             return False
 
-    def _run_consensus(self, repo_url: str, commit_hash: str, test_command: str, requirements: DynArray[str], files: DynArray[str], test_results_url: str) -> dict:
+    def _run_consensus(self, repo_url: str, commit_hash: str, test_command: str, requirements: list[str], files: list[str], test_results_url: str) -> dict:
         """Run the single non-deterministic consensus round.
 
         Returns the agreed scorecard dict: functional, quality, security,
@@ -590,7 +622,8 @@ class Attestation(gl.Contract):
                 return False
             return self._verify(leaders_res.calldata, mine)
 
-        verified = gl.vm.run_nondet_unsafe(leader_work, validator)
+        # run_nondet_unsafe was renamed in the 2.x runner that Studio Dev runs.
+        verified = gl.vm.run_nondet_default(leader_work, validator)
 
         evidence_hash = str(
             hash(
@@ -661,9 +694,9 @@ class Attestation(gl.Contract):
         repo_url: str,
         commit_hash: str,
         test_command: str,
-        requirements: DynArray[str],
+        requirements: list[str],
         deadline: int,
-        files: DynArray[str],
+        files: list[str],
         test_results_url: str = "",
     ) -> None:
         """Issuer posts a verification job for an agent's deliverable.
@@ -698,14 +731,12 @@ class Attestation(gl.Contract):
         self.jobs[job_id] = Job(
             issuer=sender,
             agent=agent,
-            artifact=CodeArtifact(
-                repo_url=repo_url,
-                commit_hash=commit_hash,
-                test_command=test_command,
-                requirements=requirements,
-                files=files,
-                test_results_url=test_results_url,
-            ),
+            repo_url=repo_url,
+            commit_hash=commit_hash,
+            test_command=test_command,
+            requirements_joined=_join(requirements),
+            files_joined=_join(files),
+            test_results_url=test_results_url,
             deadline=u256(deadline),
             recorded=False,
             verdict="",
@@ -825,12 +856,12 @@ class Attestation(gl.Contract):
             raise gl.vm.UserError("Agent not registered")
 
         result = self._run_consensus(
-            job.artifact.repo_url,
-            job.artifact.commit_hash,
-            job.artifact.test_command,
-            job.artifact.requirements,
-            job.artifact.files,
-            job.artifact.test_results_url,
+            job.repo_url,
+            job.commit_hash,
+            job.test_command,
+            _split(job.requirements_joined),
+            _split(job.files_joined),
+            job.test_results_url,
         )
 
         scorecard = Scorecard(
@@ -871,7 +902,7 @@ class Attestation(gl.Contract):
         # Reserve the artifact key ONLY now, when real verification consumed
         # it. Posting a job no longer burns the key.
         self.reviewed[
-            self._artifact_key(job.artifact.repo_url, job.artifact.commit_hash)
+            self._artifact_key(job.repo_url, job.commit_hash)
         ] = "1"
 
         return result["verdict"]
@@ -1091,10 +1122,10 @@ class Attestation(gl.Contract):
                 "exists": True,
                 "issuer": job.issuer,
                 "agent": job.agent,
-                "repo_url": job.artifact.repo_url,
-                "commit_hash": job.artifact.commit_hash,
-                "test_command": job.artifact.test_command,
-                "requirements": list(job.artifact.requirements),
+                "repo_url": job.repo_url,
+                "commit_hash": job.commit_hash,
+                "test_command": job.test_command,
+                "requirements": _split(job.requirements_joined),
                 "deadline": int(job.deadline),
                 "recorded": job.recorded,
                 "accepted": bool(job.accepted),

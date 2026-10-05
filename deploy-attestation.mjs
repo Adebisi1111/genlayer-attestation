@@ -1,26 +1,34 @@
-// Deploy Attestation to Studio Net (61999) using genlayer-js directly.
+// Deploy Attestation to Studio Dev (61997) using genlayer-js directly.
 // deployContract({ code }) takes the source BYTES. The `genlayer deploy` CLI
 // submits an empty type-0 payload on this network and creates nothing, so the
 // SDK path is the only one that works here.
 import { createClient, createAccount } from 'genlayer-js';
-import { studionet } from 'genlayer-js/chains';
+import { studioDevnet } from 'genlayer-js/chains';
 import fs from 'fs';
 
 const PK = process.env.DEPLOY_PK;
 if (!PK) { console.error('DEPLOY_PK not set'); process.exit(1); }
 
-const CONTRACT = '/home/administrator/agent-attestation/contracts/attestation.py';
+const CONTRACT = '/home/administrator/attestation/contracts/attestation.py';
 
 async function main() {
   const account = createAccount(PK);
-  const client = createClient({ chain: studionet, account });
+  const client = createClient({ chain: studioDevnet, account });
 
   const code = fs.readFileSync(CONTRACT);
   console.log('Contract bytes:', code.length);
 
+  // The network rejects a deployment with no fee attached
+  // (FeeValueMustBeNonZero), and a deploy without it reverts before executing:
+  // receipt status 0, gasUsed 0, no contract created. Fees must be estimated
+  // explicitly rather than left to the client.
+  const fees = await createClient({ chain: studioDevnet }).estimateTransactionFees({});
+  console.log('feeValue:', String(fees.feeValue), 'distribution:', String(fees.distribution));
+
   const result = await client.deployContract({
     code: new Uint8Array(code),
     args: [],
+    fees: { distribution: fees.distribution, feeValue: fees.feeValue },
   });
   console.log('Deploy TX:', result);
 
@@ -42,7 +50,7 @@ async function main() {
   // The SDK reports status 5 even when the method raised, so read the leader
   // execution result from the explorer rather than trusting the status.
   try {
-    const r = await fetch(`https://explorer-studio.genlayer.com/api/transactions/${result}`);
+    const r = await fetch(`https://explorer-studio-dev.genlayer.com/api/transactions/${result}`);
     const j = await r.json();
     const lr = j?.transaction?.consensus_data?.leader_receipt;
     const e = Array.isArray(lr) ? lr[0] : lr;

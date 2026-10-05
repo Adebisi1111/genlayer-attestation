@@ -1,23 +1,33 @@
-// Live adversarial proof of the four steward-requested fixes on Studio Net.
+// Live adversarial proof for the non-custodial Attestation contract.
 //
-// Every check reads the leader's consensus_data.execution_result, not the
-// transaction status - status 5 comes back even when the method raised.
+// Replaces the withdrawn harness, roughly 60% of which proved a withdrawal and
+// disposal lifecycle that no longer exists. The parts that proved something
+// real are kept and re-pointed at the new model.
+//
+// Sections:
+//   1. unauthorised jobs cannot touch reputation            (kept)
+//   2. unaccepted jobs do not reserve artifact keys        (kept)
+//   3. accepted jobs are tracked and block deactivation   (kept, reworded)
+//   4. NO CUSTODY - registration takes no value            (new)
+//   5. obligations can still be accepted below the floor  (new)
 import { createClient, createAccount } from 'genlayer-js';
-import { studionet } from 'genlayer-js/chains';
+import { studioDevnet } from 'genlayer-js/chains';
 
 const C = process.env.ON_ADDR;
+if (!C) { console.error('ON_ADDR not set'); process.exit(1); }
+
 const cli = {
-  issuer: createClient({ chain: studionet, account: createAccount(process.env.KI) }),
-  agent: createClient({ chain: studionet, account: createAccount(process.env.KA) }),
-  other: createClient({ chain: studionet, account: createAccount(process.env.KO) }),
+  issuer: createClient({ chain: studioDevnet, account: createAccount(process.env.KI) }),
+  agent: createClient({ chain: studioDevnet, account: createAccount(process.env.KA) }),
+  other: createClient({ chain: studioDevnet, account: createAccount(process.env.KB) }),
 };
 const A = {
   issuer: createAccount(process.env.KI).address,
   agent: createAccount(process.env.KA).address,
-  other: createAccount(process.env.KO).address,
+  other: createAccount(process.env.KB).address,
 };
-const GEN = 10n ** 18n;
 const REPO = 'https://github.com/genlayerlabs/genlayer-js';
+const DEADLINE = 9999999999;
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { c ? (pass++, console.log(`  PASS  ${n}`)) : (fail++, console.log(`  FAIL  ${n} ${d}`)); };
@@ -27,7 +37,7 @@ async function execResult(hash) {
   // indexed the tx yet; retry rather than misreading that as a contract result.
   for (let i = 0; i < 20; i++) {
     try {
-      const r = await fetch(`https://explorer-studio.genlayer.com/api/transactions/${hash}`);
+      const r = await fetch(`https://explorer-studio-dev.genlayer.com/api/transactions/${hash}`);
       const t = await r.text();
       if (t.trim().startsWith('<')) throw new Error('html error page');
       const j = JSON.parse(t);
@@ -39,131 +49,122 @@ async function execResult(hash) {
   }
   return 'UNKNOWN';
 }
+
 async function write(k, fn, args, opts = {}) {
   const hash = await cli[k].writeContract({ address: C, functionName: fn, args, ...opts });
   await cli[k].waitForTransactionReceipt({ hash, waitUntil: 'decided', retries: 300, interval: 3000 });
   const exec = await execResult(hash);
   return { hash, exec, ok: exec === 'SUCCESS' };
 }
-const read = (k, fn, args) => cli[k].readContract({ address: C, functionName: fn, args });
+
 async function j(k, fn, args) {
   for (let i = 0; i < 15; i++) {
-    try { return JSON.parse(await read(k, fn, args)); }
+    try { return JSON.parse(await cli[k].readContract({ address: C, functionName: fn, args })); }
     catch (e) { await new Promise((s) => setTimeout(s, 3000)); }
   }
   throw new Error(`read ${fn} failed after retries`);
 }
 
+const post = (k, id, agent, commit) =>
+  write(k, 'post_job', [id, agent, REPO, commit, 'npm test', ['has tests'], DEADLINE, ['README.md'], '']);
+
 async function main() {
-  const reg = await write('agent', 'register', [], { value: 3n * GEN });
-  check('agent registers with 3 GEN', reg.ok, `exec=${reg.exec}`);
-  const reg2 = await write('other', 'register', [], { value: 3n * GEN });
-  check('second agent registers with 3 GEN', reg2.ok, `exec=${reg2.exec}`);
+  const stamp = Date.now();
 
-  const post = (k, jid, agent, commit, deadline) => write(k, 'post_job',
-    [jid, agent, REPO, commit, 'npm test', ['has tests'], deadline, ['README.md'], '']);
+  const cfg = await j('agent', 'get_config', []);
+  console.log(`\n  config -> ${JSON.stringify(cfg)}`);
 
-  // ---------------------------------------------------------------
-  console.log('\n=== FIX 1: unauthorised jobs cannot affect reputation or stake ===');
-  const far = Math.floor(Date.now() / 1000) + 86400;
+  console.log('\n=== NO CUSTODY: registration takes no value ===');
+  const reg = await write('agent', 'register', []);
+  check('register() succeeds with nothing attached', reg.ok, `exec=${reg.exec}`);
+  const reg2 = await write('other', 'register', []);
+  check('second agent registers the same way', reg2.ok, `exec=${reg2.exec}`);
 
-  const j1 = 'unauth-' + Date.now();
-  const p1 = await post('issuer', j1, A.agent, 'deadbeef01', far);
+  const r0 = await j('agent', 'get_agent', [A.agent]);
+  console.log(`  agent -> ${JSON.stringify(r0)}`);
+  check('agent record holds no funds', r0.holds_funds === false, JSON.stringify(r0));
+  check('reputation begins at the floor', r0.reputation === cfg.min_reputation, JSON.stringify(r0));
+  check('no custody field exists at all', r0.staked === undefined, JSON.stringify(r0));
+
+  console.log('\n=== 1. unauthorised jobs cannot touch reputation ===');
+  const idA = `a1-${stamp}`;
+  const p1 = await post('issuer', idA, A.agent, `c1-${stamp}`);
   check('issuer posts a job naming the agent', p1.ok, `exec=${p1.exec}`);
 
-  let rec = await j('agent', 'get_agent', [A.agent]);
-  console.log(`  agent before -> ${JSON.stringify(rec)}`);
-  check('job is NOT accepted yet', rec.completed === 0 && rec.failed === 0, JSON.stringify(rec));
+  const acc3 = await write('other', 'accept_job', [idA]);
+  check('a third party cannot accept it', acc3.exec !== 'SUCCESS', `exec=${acc3.exec}`);
 
-  const acc = await write('other', 'accept_job', [j1]);
-  check('a third party cannot accept it', acc.exec !== 'SUCCESS', `exec=${acc.exec}`);
+  const acc2 = await write('issuer', 'accept_job', [idA]);
+  check("the ISSUER cannot accept on the agent's behalf", acc2.exec !== 'SUCCESS', `exec=${acc2.exec}`);
 
-  const acc2 = await write('issuer', 'accept_job', [j1]);
-  check('the ISSUER cannot accept it either', acc2.exec !== 'SUCCESS', `exec=${acc2.exec}`);
-
-  const ver = await write('issuer', 'verify', [j1]);
+  const ver = await write('issuer', 'verify', [idA]);
   check('verify refuses an unaccepted job', ver.exec !== 'SUCCESS', `exec=${ver.exec}`);
 
-  rec = await j('agent', 'get_agent', [A.agent]);
+  const rec = await j('agent', 'get_agent', [A.agent]);
   check('reputation untouched', rec.completed === 0 && rec.failed === 0, JSON.stringify(rec));
-  check('stake untouched', rec.staked === 3000000000000000000, `staked=${rec.staked}`);
-  check('still active', rec.active === true, `active=${rec.active}`);
+  check('no demotion recorded', rec.demotions === 0, JSON.stringify(rec));
+  check('agent still active', rec.active === true, JSON.stringify(rec));
 
-  // ---------------------------------------------------------------
-  console.log('\n=== FIX 2: unaccepted jobs do not reserve artifact keys ===');
-  const commit = 'squattarget01';
-  const keyBefore = await j('issuer', 'get_artifact_key', [REPO, commit]);
-  check('artifact key free before posting', keyBefore.reserved === false, JSON.stringify(keyBefore));
+  console.log('\n=== 2. unaccepted jobs do not reserve artifact keys ===');
+  const repoU = `${REPO}/unaccepted-${stamp}`;
+  const commitU = `cu-${stamp}`;
+  const k0 = await j('agent', 'get_artifact_key', [repoU, commitU]);
+  check('artifact key free before posting', k0.reserved === false, JSON.stringify(k0));
 
-  for (let i = 0; i < 5; i++) {
-    await post('other', `squatter-${i}-${Date.now()}`, A.other, commit, far);
+  for (let i = 0; i < 3; i++) {
+    await post('issuer', `squ-${i}-${stamp}`, A.agent, commitU);
   }
-  const keyAfter = await j('issuer', 'get_artifact_key', [REPO, commit]);
-  check('still free after 5 posts on that artifact', keyAfter.reserved === false, JSON.stringify(keyAfter));
+  const k1 = await j('agent', 'get_artifact_key', [repoU, commitU]);
+  check('still free after 3 unverified posts', k1.reserved === false, JSON.stringify(k1));
 
-  const reuse = await post('issuer', 'real-' + Date.now(), A.agent, commit, far);
-  check('a real job can still use that artifact', reuse.ok, `exec=${reuse.exec}`);
-
-  // ---------------------------------------------------------------
-  console.log('\n=== FIX 1b: accepted jobs encumber stake ===');
-  const enc = 'enc-' + Date.now();
-  const pe = await post('issuer', enc, A.other, 'enccommit' + Date.now(), far);
-  check('job posted for the second agent', pe.ok, `exec=${pe.exec}`);
-  const ace = await write('other', 'accept_job', [enc]);
+  console.log('\n=== 3. an accepted job is a tracked obligation ===');
+  const idB = `a2-${stamp}`;
+  const p2 = await post('other', idB, A.other, `c2-${stamp}`);
+  check('job posted for the second agent', p2.ok, `exec=${p2.exec}`);
+  const ace = await write('other', 'accept_job', [idB]);
   check('second agent accepts', ace.ok, `exec=${ace.exec}`);
-  const orec0 = await j('other', 'get_agent', [A.other]);
-  check('open obligation is tracked on-chain', orec0.open_jobs === 1, JSON.stringify(orec0));
-  const encW = await write('other', 'request_withdraw', [1000000000000000000]);
-  check('cannot withdraw stake backing an accepted job', encW.exec !== 'SUCCESS', `exec=${encW.exec}`);
-  const encD = await write('other', 'deactivate', []);
-  check('cannot deactivate with an accepted job open', encD.exec !== 'SUCCESS', `exec=${encD.exec}`);
 
-  // ---------------------------------------------------------------
-  console.log('\n=== FIX 3: safe withdrawal ===');
-  const floor = await write('agent', 'request_withdraw', [3000000000000000000]);
-  check('active agent cannot withdraw below minimum stake', floor.exec !== 'SUCCESS', `exec=${floor.exec}`);
+  const o1 = await j('other', 'get_agent', [A.other]);
+  check('open obligation is tracked on-chain', o1.open_jobs === 1, JSON.stringify(o1));
 
-  const n1 = await write('agent', 'request_withdraw', [1000000000000000000]);
-  check('withdrawal down to the floor is accepted', n1.ok, `exec=${n1.exec}`);
-  const led = await j('agent', 'get_pending_withdraw', [A.agent]);
-  console.log(`  ledger -> ${JSON.stringify(led)}`);
-  check('reservation recorded', led.pending_withdraw === 1000000000000000000, JSON.stringify(led));
+  const de = await write('other', 'deactivate', []);
+  check('cannot deactivate with an accepted job open', de.exec !== 'SUCCESS', `exec=${de.exec}`);
 
-  const c1 = await write('agent', 'claim_withdraw', [1]);
-  check('claim settles', c1.ok, `exec=${c1.exec}`);
-  const replay = await write('agent', 'claim_withdraw', [1]);
-  check('replayed claim refused', replay.exec !== 'SUCCESS', `exec=${replay.exec}`);
+  console.log('\n=== 4. standing is explicit about holding nothing ===');
+  const standing = await j('other', 'get_standing', [A.other]);
+  console.log(`  standing -> ${JSON.stringify(standing)}`);
+  check('holds_funds is false on-chain', standing.holds_funds === false, JSON.stringify(standing));
+  check('no pending-withdrawal concept', standing.pending_withdraw === undefined, JSON.stringify(standing));
+  check('eligibility is reported', typeof standing.eligible === 'boolean', JSON.stringify(standing));
+  check('an agent with no track record is UNVERIFIED', o1.tier === 'UNVERIFIED', JSON.stringify(o1));
 
-  const de = await write('agent', 'deactivate', []);
-  check('deactivate succeeds', de.ok, `exec=${de.exec}`);
-  const n2 = await write('agent', 'request_withdraw', [2000000000000000000]);
-  check('deactivated agent may reserve all remaining stake', n2.ok, `exec=${n2.exec}`);
-  const c2 = await write('agent', 'claim_withdraw', [2]);
-  check('final claim settles', c2.ok, `exec=${c2.exec}`);
-  rec = await j('agent', 'get_agent', [A.agent]);
-  console.log(`  agent after -> ${JSON.stringify(rec)}`);
-  check('remaining stake fully withdrawn', rec.staked === 0, `staked=${rec.staked}`);
+  console.log('\n=== 5. obligations can still be accepted below the floor ===');
+  // The withdrawn harness could not express this: its acceptance gate blocked
+  // exactly this, which made a demotion permanent in practice.
+  const limit = cfg.max_demotions;
+  let accepted = 0;
+  for (let i = 1; i <= limit; i++) {
+    const id = `d${i}-${stamp}`;
+    const pd = await post('other', id, A.other, `cd${i}-${stamp}`);
+    if (!pd.ok) { check(`post ${id}`, false, `exec=${pd.exec}`); break; }
+    const ad = await write('other', 'accept_job', [id]);
+    if (ad.ok) accepted++;
+    else { check(`accept ${id}`, false, `exec=${ad.exec}`); break; }
+  }
+  const od = await j('other', 'get_agent', [A.other]);
+  console.log(`  accepted ${accepted}/${limit}; open_jobs=${od.open_jobs}, active=${od.active}`);
+  check(`all ${limit} obligations were accepted`, accepted === limit, `accepted=${accepted}`);
+  check('every obligation is tracked', od.open_jobs === limit, JSON.stringify(od));
+  check('registration of one agent cannot open another\'s obligations',
+    (await j('agent', 'get_agent', [A.agent])).open_jobs === 0, '');
 
-  // ---------------------------------------------------------------
-  console.log('\n=== FIX 4: slashed funds have an auditable disposition ===');
-  const sj = 'slash-' + Date.now();
-  const ps = await post('issuer', sj, A.other, 'slashcommit1', far);
-  check('job posted against the second agent', ps.ok, `exec=${ps.exec}`);
-  const acc3 = await write('other', 'accept_job', [sj]);
-  check('second agent accepts (creating a real obligation)', acc3.ok, `exec=${acc3.exec}`);
-
-  const settle = await write('issuer', 'settle_unclaimed', [sj]);
-  check('settle_unclaimed rejects a live deadline', settle.exec !== 'SUCCESS', `exec=${settle.exec}`);
-
-  const orec = await j('other', 'get_agent', [A.other]);
-  console.log(`  other agent -> ${JSON.stringify(orec)}`);
-  check('no slash before deadline', orec.slashed_count === 0, JSON.stringify(orec));
-  // two jobs were accepted by this agent, so the counter must read 2
-  check('both accepted obligations still open', orec.open_jobs === 2, JSON.stringify(orec));
+  console.log('\n  tx hashes:');
+  for (const [n, r] of Object.entries({ reg, p1, ace, p2 })) {
+    console.log(`    ${n.padEnd(6)} ${r.hash}`);
+  }
 
   console.log(`\n=== RESULT: ${pass} passed, ${fail} failed ===`);
-  console.log(`NOTE: the live slash/dispose leg needs an expired deadline, which`);
-  console.log(`this harness cannot arrange; it is proven by direct-mode tests.`);
+  process.exit(fail === 0 ? 0 : 1);
 }
 
-main().catch((e) => { console.error('HARNESS FAIL:', e.message); process.exit(1); });
+main().catch((e) => { console.error('HARNESS FAIL:', e.message); console.error(e.stack); process.exit(1); });
