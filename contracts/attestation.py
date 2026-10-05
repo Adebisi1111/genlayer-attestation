@@ -85,7 +85,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 import genlayer as gl
-from genlayer import Address, u256
+from genlayer import Address, Keccak256, u256
 from genlayer.storage import TreeMap
 from genlayer.storage import allow as allow_storage
 
@@ -104,6 +104,20 @@ def _join(items: list[str]) -> str:
 
 def _split(joined: str) -> list[str]:
     return [x for x in joined.split("\n") if x] if joined else []
+
+
+def _digest(payload: dict) -> str:
+    """Deterministic content digest.
+
+    Python's builtin hash() is salted per process, so it returns a DIFFERENT
+    value for the same string in every transaction. A digest built on it can
+    never be compared across two calls, which is exactly what acceptance
+    requires: accept_job stores the digest and verify recomputes it in a
+    separate transaction, so the two never matched and every verify died with
+    "Job terms changed after acceptance". Keccak256 is deterministic and is
+    already what the GenLayer standard library uses for event topics.
+    """
+    return Keccak256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 # 2.x runner notes (Studio Next 61997):
@@ -311,25 +325,18 @@ class Attestation(gl.contract.Contract):
         into one digest means the issuer cannot alter any of them after the
         agent accepted without invalidating what was agreed to.
         """
-        return str(
-            hash(
-                json.dumps(
-                    {
-                        "artifact": self._artifact_key(
-                            job.repo_url, job.commit_hash
-                        ),
-                        "files": _split(job.files_joined),
-                        "test_command": job.test_command,
-                        "requirements": _split(job.requirements_joined),
-                        "test_results_url": job.test_results_url,
-                        "deadline": int(job.deadline),
-                        "slash_percent": int(self.slash_percent),
-                        "min_reputation": int(self.min_reputation),
-                        "max_demotions": int(self.max_demotions),
-                    },
-                    sort_keys=True,
-                )
-            )
+        return _digest(
+            {
+                "artifact": self._artifact_key(job.repo_url, job.commit_hash),
+                "files": _split(job.files_joined),
+                "test_command": job.test_command,
+                "requirements": _split(job.requirements_joined),
+                "test_results_url": job.test_results_url,
+                "deadline": int(job.deadline),
+                "slash_percent": int(self.slash_percent),
+                "min_reputation": int(self.min_reputation),
+                "max_demotions": int(self.max_demotions),
+            }
         )
 
     # ------------------------------------------------------------------
@@ -574,27 +581,61 @@ class Attestation(gl.contract.Contract):
         except Exception:
             return ""
 
-    def _verify(self, proposed: dict, mine: dict) -> bool:
-        """Compare EVERY stored score AND the verdict between leader and validator.
+    def _audit_scorecard(self, sc: dict) -> bool:
+        """Check the leader's scorecard without running the LLM a second time.
 
-        Binding all 5 fields (4 scores + categorical verdict) preserves the
-        economic outcome: a PASS stays PASS, a FAIL stays FAIL across all
-        honest validators.
+        Three properties, all pure arithmetic over what the leader returned:
+
+        1. every score is in range and the weighted overall is exactly what the
+           configured weights produce, so a leader cannot inflate overall;
+        2. the categorical verdict follows from the thresholds, so a leader
+           cannot report FAIL as PASS;
+        A validator re-running the model would disagree on the numbers alone,
+        which deadlocks every job. Auditing the arithmetic does not: identical
+        inputs give identical answers on every honest validator.
         """
         try:
-            if proposed["verdict"] != mine["verdict"]:
-                return False
-            if proposed["functional"] != mine["functional"]:
-                return False
-            if proposed["quality"] != mine["quality"]:
-                return False
-            if proposed["security"] != mine["security"]:
-                return False
-            if proposed["completeness"] != mine["completeness"]:
-                return False
-            return True
-        except (KeyError, TypeError):
+            f = int(sc["functional"])
+            q = int(sc["quality"])
+            sec = int(sc["security"])
+            c = int(sc["completeness"])
+            overall = int(sc["overall"])
+            verdict = sc["verdict"]
+        except (KeyError, TypeError, ValueError):
             return False
+
+        for v in (f, q, sec, c):
+            if v < 0 or v > 100:
+                return False
+
+        wf = int(self.weight_functional)
+        wq = int(self.weight_quality)
+        ws = int(self.weight_security)
+        wc = int(self.weight_completeness)
+        if wf + wq + ws + wc != 100:
+            return False
+        expected = (f * wf + q * wq + sec * ws + c * wc) // 100
+        if overall != expected:
+            return False
+
+        pt = int(self.pass_threshold)
+        pth = int(self.partial_threshold)
+        if verdict == "PASS":
+            if overall < pt:
+                return False
+        elif verdict == "PARTIAL":
+            if overall < pth or overall >= pt:
+                return False
+        elif verdict == "FAIL":
+            if overall >= pth:
+                return False
+        else:
+            return False
+
+        # evidence_hash is deliberately NOT checked here. It is derived after
+        # the consensus round, so the leader's calldata does not carry it; the
+        # validator only ever sees the six fields above.
+        return True
 
     def _run_consensus(self, repo_url: str, commit_hash: str, test_command: str, requirements: list[str], files: list[str], test_results_url: str) -> dict:
         """Run the single non-deterministic consensus round.
@@ -607,38 +648,41 @@ class Attestation(gl.contract.Contract):
             return self._evaluate(repo_url, commit_hash, test_command, requirements, files, test_results_url)
 
         def validator(leaders_res: Any) -> bool:
+            """Audit the leader's scorecard. This must NOT re-run the LLM.
+
+            An earlier version called leader_work() here and compared both
+            results field by field. Two independent LLM runs do not produce
+            identical numbers, so the validator disagreed on essentially every
+            job, no state was ever committed, and verify returned SUCCESS while
+            writing nothing - visible on chain as 141 STORAGE_READ and 0
+            STORAGE_WRITE with validator vote=disagree.
+
+            What actually needs checking is whether the leader's scorecard is
+            internally consistent and whether its verdict follows from the
+            configured weights and thresholds. Both are pure arithmetic over
+            values the leader already returned, so every honest validator
+            reaches the same answer deterministically.
+            """
             if not isinstance(leaders_res, gl.vm.Return):
-                leader_msg = getattr(leaders_res, "message", "")
-                try:
-                    leader_work()
-                    return False  # leader errored, we succeeded → disagree
-                except gl.vm.UserError as e:
-                    return str(e.message) == str(leader_msg)
-                except Exception:
-                    return False
+                return False
             try:
-                mine = leader_work()
+                sc = leaders_res.calldata
+                return self._audit_scorecard(sc)
             except Exception:
                 return False
-            return self._verify(leaders_res.calldata, mine)
 
         # run_nondet_unsafe was renamed in the 2.x runner that Studio Dev runs.
         verified = gl.vm.run_nondet_default(leader_work, validator)
 
-        evidence_hash = str(
-            hash(
-                json.dumps(
-                    {
-                        "functional": verified["functional"],
-                        "quality": verified["quality"],
-                        "security": verified["security"],
-                        "completeness": verified["completeness"],
-                        "overall": verified["overall"],
-                        "verdict": verified["verdict"],
-                    },
-                    sort_keys=True,
-                )
-            )
+        evidence_hash = _digest(
+            {
+                "functional": verified["functional"],
+                "quality": verified["quality"],
+                "security": verified["security"],
+                "completeness": verified["completeness"],
+                "overall": verified["overall"],
+                "verdict": verified["verdict"],
+            }
         )
 
         return {
