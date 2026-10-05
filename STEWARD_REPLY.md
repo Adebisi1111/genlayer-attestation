@@ -84,9 +84,70 @@ Worth stating plainly, because they were all mine:
 All three were caught by tests asserting the new behaviour, not by reading the
 code.
 
-**Tests: 35 passing.** No Studio Net required. The withdrawn contract's address
-is not carried over — this is a different contract with a different API.
+## And three more that only the live contract exposed
 
-Contract: `_TO BE FILLED_`
-Source: https://github.com/Adebisi1111/attestation
-Deployed source matches commit: `_TO BE FILLED_`
+The rewrite above was not the last of it. Deploying it surfaced failures that
+no local test would have caught, because the local suite cannot run against the
+2.x runner this contract pins.
+
+4. **`hash()` is salted per process.** The terms digest was built on Python's
+   builtin `hash()`, which returns a different value in every transaction.
+   `accept_job` stored one, `verify` recomputed another, and every verification
+   died with "Job terms changed after acceptance." Now `Keccak256`.
+
+5. **The validator re-ran the LLM and deadlocked.** Requiring two independent
+   model runs to agree on all six values meant agreement almost never happened.
+   `verify()` reported SUCCESS with 141 storage reads and **zero** writes, a
+   scorecard that read back as missing, and reputation unchanged. Validators now
+   audit the leader's arithmetic deterministically instead.
+
+6. **The audit then required a field the leader never returns** — the evidence
+   hash is derived after consensus, so the validator's calldata has no such key.
+   It raised, returned false, and deadlocked identically.
+
+Each was found by reading the leader receipt instead of trusting the success
+message. `docs/CONSENSUS.md` records the method, including the two fields that
+tell you whether a commit actually happened: `STORAGE_WRITE` in the leader's
+`call_counts`, and the validator's `vote`.
+
+One receipt detail that looks like a failure and is not: the validator reports
+`execution_result: ERROR` with `CONSENSUS_VALIDATOR_QUORUM_REACHED`. That is a
+validator being cancelled *because quorum was already reached*. The round
+committed.
+
+## Evidence
+
+**I am not claiming a passing test suite.** The contract pins the 2.x runner
+that actually executes on 61997, and that runner is not published for local
+download — the newest GenVM build ships only two `py-genlayer` runners and this
+is neither. The suite passed against the earlier 1.x draft and has not been
+re-run since the rewrite. There is no local workaround, so rather than imply
+otherwise, here is what *is* verified against the deployed contract:
+
+- **Full lifecycle, 9/9**, real signed transactions: `register -> post_job ->
+  accept_job -> verify -> published scorecard -> reputation credit`.
+- **Seven adversarial paths**, all rejected by the deployed contract: duplicate
+  `job_id`, the same `(repo, commit)` re-reviewed, `verify` without acceptance,
+  `settle_unclaimed` before the deadline, `verify` after `decline_job`, and
+  double `verify`. Plus: scores are clamped to 0-100 before consensus, so the
+  audit cannot be gamed by inflating raw output, and only
+  `raw.githubusercontent.com` is ever fetched, so a posted URL cannot reach
+  anything else.
+- **One real repository at a real commit**, scored `95 / 96 / 91 / 95`, overall
+  `94`, verdict `PASS`. Both derived figures were recomputed independently and
+  match: `95*40 + 96*25 + 91*25 + 95*10 = 9425 // 100 = 94`, and `300 + 94 = 394`.
+
+All three scripts are in the repository and re-runnable.
+
+```
+Contract:              0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
+Network:               GenLayer Studio Dev / Next 61997
+Explorer:              https://explorer-studio-dev.genlayer.com/address/0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
+Lifecycle tx:          0x8548ff90e67bb0e4346b51a4c9aecadb3220c3c235f5132ce4a7731fac10ebc3
+Source:                https://github.com/Adebisi1111/genlayer-attestation
+Commit:                c33da14c6457bacc2a7917924f91ea47e166516d
+contracts/attestation.py: 50623 bytes, sha256 6d26ed6ee2f0278e60d609ac52af9dde70d81d2a72e04f27f3228e7f54f8e63f
+```
+
+The withdrawn contract's address is not carried over — this is a different
+contract with a different API, and it holds no funds.
