@@ -86,10 +86,37 @@ The weighted arithmetic is independently checkable from the published values:
 match what the contract stored, which is exactly the property the audit
 enforces.
 
-## Known caveat
+## The validator receipt that looks like an error but is not
 
-On that transaction the leader committed correctly and all checks passed, but
-the validator receipt shows `vote: idle, execution_result: ERROR`. The state was
-written and the scorecard is public, so consensus did land — but that validator
-ERROR is not explained. It may be benign validator-side non-determinism or it
-may be latent. It is recorded here rather than smoothed over.
+The successful lifecycle transaction showed:
+
+```
+[0] leader    vote=None    exec=SUCCESS
+[1] validator vote=idle    exec=ERROR
+```
+
+That second line is not a failure. Decoded, the validator's own fields say:
+
+```
+result       "\x02idle"
+stderr       "Validator execution cancelled after quorum"
+error_code   CONSENSUS_VALIDATOR_QUORUM_REACHED
+causes       ["VALIDATOR_QUORUM_REACHED"]
+```
+
+Once enough validators have agreed, the remaining ones are cancelled to save
+work. A cancelled validator reports `execution_result: ERROR` with a quorum
+error code and never produces calldata. The transaction committed because
+quorum was reached — which the leader receipt and the published scorecard both
+confirm independently.
+
+So the check for "did this commit" is, in order:
+
+1. `execution_result` on the **leader** receipt is `SUCCESS`, and
+2. `STORAGE_WRITE > 0` in the leader's `call_counts`, and
+3. the validator vote is `None`/`idle` **or** `disagree`.
+
+A validator showing `vote=idle` with `CONSENSUS_VALIDATOR_QUORUM_REACHED` is
+the expected shape of a healthy multi-validator round. Only
+`CONSENSUS_VALIDATOR_QUORUM_REACHED` absent *and* `vote=disagree` means the
+deadlock described above.

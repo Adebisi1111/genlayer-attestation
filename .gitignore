@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 artifacts/
 .pytest_cache/
+node_modules/
+*.log

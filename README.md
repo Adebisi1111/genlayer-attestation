@@ -243,15 +243,51 @@ validation rules.
 | `test_register.py` | 7 | registration, no-custody, demotion, recovery |
 | `test_adversarial.py` | 13 | griefing, key squatting, terms, eligibility |
 
-**These currently do not run.** The contract pins the 2.x runner hash in its
-`# { "Depends": ... }` header, and only an older 1.x runner is cached locally;
-the current build is no longer published and re-downloading it 404s. The suite
-passed against the earlier 1.x draft and has not been re-run since the rewrite,
-so no pass count is claimed here. What *is* verified is the live contract:
+**These currently do not run, and that is not fixable locally.** The contract
+pins the 2.x runner in its `# { "Depends": ... }` header — the same hash the
+other deployed 2.x contracts pin, and the runner that actually executes on
+Studio Dev 61997. `gltest` resolves that hash from the newest published GenVM
+build, and that build ships only two `py-genlayer` runners, neither of which is
+this one:
+
+```
+$ tar -tJf genvm-universal-v0.3.0-rc7.tar.xz | grep 'runners/py-genlayer/'
+runners/py-genlayer/1j/b45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6.tar
+runners/py-genlayer/1z/r6nqk597d97kg0dyxg0shhrykx5v02zjgnyrajapy4wlqvfvwh.tar
+```
+
+So the runner exists on 61997 but is not published for local download. The
+suite passed against the earlier 1.x draft and has not been re-run since the
+rewrite, so no pass count is claimed here. What is verified is the live
+contract:
 
 ```bash
 CA=<address> DEPLOY_PK=<key> node _lifecycle.mjs   # 9/9, real signed txs
 CA=<address> DEPLOY_PK=<key> node _onchain_verify.mjs
+```
+
+### Adversarial paths, also live
+
+`_gaps.mjs` drives the deployed contract through the paths a reviewer would
+attack, each a real signed transaction. All seven hold:
+
+| Probe | Result |
+|---|---|
+| duplicate `job_id` | rejected |
+| same `(repo, commit)` re-reviewed | rejected |
+| `verify` without acceptance | rejected |
+| `settle_unclaimed` before deadline | rejected |
+| `verify` after `decline_job` | rejected |
+| agent verifies its own accepted job | allowed, as designed |
+| double `verify` of a recorded job | rejected |
+
+Plus two properties checked by reading the source: scores are clamped to 0-100
+before consensus, so the audit cannot be gamed by inflating raw model output;
+and only `raw.githubusercontent.com` is ever fetched, so a posted URL cannot be
+used to reach anything else.
+
+```bash
+CA=<address> DEPLOY_PK=<key> node _gaps.mjs
 ```
 
 Three properties are asserted directly against the new model:
