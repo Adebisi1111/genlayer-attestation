@@ -1,48 +1,71 @@
 # Attestation — Verifiable Intelligence for Trusted Yardsticks
 
 A standalone GenLayer Intelligent Contract primitive that evaluates work
-deliverables across 4 dimensions using a **single AI consensus round**.
+deliverables across 4 dimensions using a **single AI consensus round in which
+every validator independently re-evaluates the artifact.**
 
 ```
-Network:        GenLayer Studio Dev / Next 61997
-Contract:       0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
-Explorer:       https://explorer-studio-dev.genlayer.com/address/0xEc1cD00fefb4Dd2861d1CF426126a43b14ee3BD6
-Lifecycle tx:   0x8548ff90e67bb0e4346b51a4c9aecadb3220c3c235f5132ce4a7731fac10ebc3
+Network:        GenLayer Bradbury testnet (chain 4221)
+Contract:       0xfC0Cb63e9c4Cce0296025862Ce4592A46B5f6348
+Explorer:       https://explorer-bradbury.genlayer.com/address/0xfC0Cb63e9c4Cce0296025862Ce4592A46B5f6348
+Deploy tx:      0xe467ca96c2231e9d8fc13d6c56b9395f67aa8247f5df9dcc6db073ca0f37cf94
+Deploy result:  ACCEPTED / AGREE
 ```
 
-Deployed and verified: `register -> post_job -> accept_job -> verify ->
-published scorecard -> reputation credit` runs end to end on chain. An earlier,
-withdrawn submission is a different contract at a different address and is not
-related to this one.
+Deployed and verified: `register -> post_job -> accept_job -> verify` runs end
+to end on chain, every step reaching validator agreement — including `verify`,
+which runs the independent-evaluation consensus. Design rationale and every
+deploy-size trade-off are in [DESIGN.md](DESIGN.md); the resubmission note
+explaining the consensus fix is in
+[RESUBMISSION_CONSENSUS.md](RESUBMISSION_CONSENSUS.md).
 
 ## What it does
 
-An issuer posts a verification job: an artifact URL, a test command, and the
-requirements the work must satisfy.  When the job is ready, a leader LLM
-evaluates the deliverable across 4 dimensions inside ONE non-deterministic
-block.  Validators do **not** re-run the model — they audit the leader's
-scorecard deterministically.  Only when that audit passes does the contract
-update reputation on-chain.  See [docs/CONSENSUS.md](docs/CONSENSUS.md) for why
-re-running the model is a deadlock rather than a stronger check.
+An issuer posts a verification job: an artifact URL pinned to a commit, a test
+command, and the requirements the work must satisfy. The named agent accepts,
+binding themselves to those exact terms. When verified, a committee of
+independent validators evaluates the deliverable across four dimensions —
+functional correctness, code quality, security, completeness — and only their
+agreement updates the agent's on-chain reputation.
+
+**Validators do not trust the leader's scores, and they do not merely check the
+leader's arithmetic.** Each validator independently fetches the same pinned
+files, runs the same evaluation the leader ran, and produces its own scorecard.
+Agreement is then required within a tolerance band: each dimension within
+`SCORE_TOLERANCE` points (default 8), and the categorical verdict matching
+exactly. Honest independent evaluations land within a few points of each other,
+so the band lets them agree — while a leader that inflates a score is caught
+when a validator independently computes a materially different number and votes
+DISAGREE. Strict equality was tried first and deadlocked every job (two LLM runs
+are never bit-identical); the tolerance band is the fix. See DESIGN.md.
 
 ## Why GenLayer (and not a solo LLM)
 
 A single LLM "does this code work?" answer is unverifiable by third parties
-and unrepeatable.  Attestation instead:
+and unrepeatable. Attestation instead:
 
 - **ONE consensus round covers 4 orthogonal dimensions** (functional, quality,
   security, completeness) so builders get a structured scorecard, not just
   pass/fail.
-- **Validators audit, they do not re-evaluate.** Every validator independently
-  re-derives what the leader's numbers *must* produce — weighted overall from
-  the configured weights, verdict from the thresholds — and rejects anything
-  inconsistent. A leader cannot inflate a score, cannot mislabel a verdict, and
-  cannot commit state without the arithmetic holding up.
+- **Validators independently re-evaluate, not rubber-stamp.** Each one fetches
+  the same artifact and judges it themselves, then agrees only within tolerance
+  and on the exact verdict. This binds the substantive outcome, not just its
+  arithmetic — a leader cannot pass a FAIL deliverable by producing an
+  internally-consistent scorecard.
 - **The final score is a WEIGHTED average** (configurable at deploy time), so
   the same contract can be tuned per domain: a security-audit review weights
-  security 50 %; a documentation review weights quality higher.
-- **Reputation is tracked on-chain** and updated ONLY after
-  consensus, so the ledger is auditable and economically binding.
+  security 50%; a documentation review weights quality higher.
+- **Reputation is tracked on-chain** and updated ONLY after consensus, so the
+  ledger is auditable and derived entirely from verified outcomes.
+
+## Non-custodial by design
+
+This contract holds no funds and owes none. A GenLayer Intelligent Contract
+cannot move native funds (`emit_transfer` exists only on external contract
+proxies), so an earlier version that kept a stake ledger recorded debts it could
+never pay. That ledger was removed rather than faked. Enforcement is
+reputational: `reputation` is a public, cumulative number moved only by
+consensus outcomes, and the view methods state eligibility explicitly.
 
 ## State design
 
